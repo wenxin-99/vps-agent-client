@@ -42,6 +42,78 @@ let heartbeatInterval = null;
 let reconnectTimeout = null;
 let isConnected = false;
 
+// 检查GOST服务状态
+async function getGostStatus() {
+  try {
+    // 检查GOST服务是否运行
+    const { stdout: isActive } = await execAsync('systemctl is-active gost 2>/dev/null || echo "inactive"');
+    const active = isActive.trim() === 'active';
+    
+    if (!active) {
+      return {
+        running: false,
+        lastSync: null,
+        configHash: null,
+        ruleCount: 0
+      };
+    }
+    
+    // 读取GOST配置文件获取规则数量和哈希
+    let configHash = null;
+    let ruleCount = 0;
+    try {
+      const configPath = '/etc/gost/config.json';
+      if (fs.existsSync(configPath)) {
+        const configContent = fs.readFileSync(configPath, 'utf8');
+        const config = JSON.parse(configContent);
+        
+        // 计算配置哈希
+        const crypto = require('crypto');
+        configHash = crypto.createHash('sha256').update(configContent).digest('hex').substring(0, 16);
+        
+        // 统计规则数量（services数组长度）
+        if (config.services && Array.isArray(config.services)) {
+          ruleCount = config.services.length;
+        }
+      }
+    } catch (err) {
+      console.error('[Agent] 读取GOST配置失败:', err.message);
+    }
+    
+    // 获取最后同步时间（从gost-polling-client服务日志）
+    let lastSync = null;
+    try {
+      const { stdout: logOutput } = await execAsync(
+        'journalctl -u gost-polling-client -n 20 --no-pager 2>/dev/null | grep "配置更新完成" | tail -1'
+      );
+      if (logOutput.trim()) {
+        // 从日志中提取时间戳
+        const match = logOutput.match(/(\w{3}\s+\d{2}\s+\d{2}:\d{2}:\d{2})/);
+        if (match) {
+          lastSync = match[1];
+        }
+      }
+    } catch (err) {
+      // 忽略日志读取错误
+    }
+    
+    return {
+      running: true,
+      lastSync,
+      configHash,
+      ruleCount
+    };
+  } catch (error) {
+    console.error('[Agent] 获取GOST状态失败:', error.message);
+    return {
+      running: false,
+      lastSync: null,
+      configHash: null,
+      ruleCount: 0
+    };
+  }
+}
+
 // 获取系统监控数据
 async function getSystemStats() {
   try {
@@ -82,6 +154,9 @@ async function getSystemStats() {
     // 获取系统运行时间
     const uptime = os.uptime();
     
+    // 获取GOST服务状态
+    const gostStatus = await getGostStatus();
+    
     return {
       cpu: cpuUsage,
       memory: {
@@ -91,7 +166,8 @@ async function getSystemStats() {
         percentage: (usedMem / totalMem * 100).toFixed(1)
       },
       network: networkStats,
-      uptime: Math.floor(uptime)
+      uptime: Math.floor(uptime),
+      gost: gostStatus
     };
   } catch (error) {
     console.error('[Agent] 获取系统统计失败:', error.message);

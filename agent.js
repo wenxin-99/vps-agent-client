@@ -229,73 +229,171 @@ async function handleCommand(commandData) {
   }
 }
 
+// 发送安装进度消息
+function sendInstallProgress(step, message, progress, status = 'running') {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const progressMessage = {
+      type: 'install_progress',
+      agentId: config.agentId,
+      secret: config.secret,
+      data: {
+        step,
+        message,
+        progress,
+        status
+      },
+      timestamp: Date.now()
+    };
+    ws.send(JSON.stringify(progressMessage));
+  }
+}
+
 // 安装GOST轮询客户端
 async function installPollingClient(script) {
   console.log('[Agent] 开始安装GOST轮询客户端...');
+  sendInstallProgress('init', '开始安装GOST轮询客户端...', 0, 'running');
   
-  try {
-    // 将脚本保存到临时文件
-    const scriptPath = `/tmp/install_gost_polling_${Date.now()}.sh`;
-    fs.writeFileSync(scriptPath, script, { mode: 0o755 });
-    console.log(`[Agent] 脚本已保存到: ${scriptPath}`);
-    
-    // 执行安装脚本
-    console.log('[Agent] 正在执行安装脚本...');
-    const { stdout, stderr } = await execAsync(`bash ${scriptPath}`, {
-      timeout: 600000, // 10分钟超时（安装Node.js可能需要较长时间）
-      maxBuffer: 20 * 1024 * 1024 // 20MB缓冲区
-    });
-    
-    console.log('[Agent] 安装输出:', stdout);
-    if (stderr) {
-      console.log('[Agent] 安装错误输出:', stderr);
-    }
-    
-    // 删除临时脚本
+  return new Promise((resolve, reject) => {
     try {
-      fs.unlinkSync(scriptPath);
-    } catch (err) {
-      // 忽略删除错误
+      // 将脚本保存到临时文件
+      const scriptPath = `/tmp/install_gost_polling_${Date.now()}.sh`;
+      fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+      console.log(`[Agent] 脚本已保存到: ${scriptPath}`);
+      sendInstallProgress('save_script', '脚本已保存到临时文件', 5, 'running');
+      
+      // 使用spawn执行脚本，逐行读取输出
+      const { spawn } = require('child_process');
+      const child = spawn('bash', [scriptPath]);
+      
+      let stdout = '';
+      let stderr = '';
+      let currentProgress = 10;
+      
+      // 监听标准输出
+      child.stdout.on('data', (data) => {
+        const output = data.toString();
+        stdout += output;
+        console.log(`[Agent] 安装输出: ${output.trim()}`);
+        
+        // 根据输出内容判断安装阶段
+        if (output.includes('Node.js')) {
+          sendInstallProgress('nodejs', '正在安装Node.js...', 20, 'running');
+          currentProgress = 20;
+        } else if (output.includes('创建工作目录') || output.includes('写入')) {
+          sendInstallProgress('setup', '正在配置客户端...', 50, 'running');
+          currentProgress = 50;
+        } else if (output.includes('systemd') || output.includes('服务')) {
+          sendInstallProgress('service', '正在配置systemd服务...', 70, 'running');
+          currentProgress = 70;
+        } else if (output.includes('启动') || output.includes('enable')) {
+          sendInstallProgress('start', '正在启动服务...', 85, 'running');
+          currentProgress = 85;
+        } else if (output.includes('成功') || output.includes('active')) {
+          sendInstallProgress('complete', '安装完成！', 95, 'running');
+          currentProgress = 95;
+        } else if (currentProgress < 90) {
+          // 有输出就增加进度
+          currentProgress = Math.min(currentProgress + 2, 90);
+          sendInstallProgress('progress', output.trim().substring(0, 100), currentProgress, 'running');
+        }
+      });
+      
+      // 监听错误输出
+      child.stderr.on('data', (data) => {
+        const output = data.toString();
+        stderr += output;
+        console.log(`[Agent] 安装错误输出: ${output.trim()}`);
+      });
+      
+      // 监听进程退出
+      child.on('close', (code) => {
+        // 删除临时脚本
+        try {
+          fs.unlinkSync(scriptPath);
+        } catch (err) {
+          // 忽略删除错误
+        }
+        
+        if (code === 0) {
+          console.log('[Agent] GOST轮询客户端安装成功');
+          sendInstallProgress('success', 'GOST轮询客户端安装成功！', 100, 'success');
+          
+          // 发送最终结果
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const resultMessage = {
+              type: 'install_result',
+              agentId: config.agentId,
+              secret: config.secret,
+              data: {
+                success: true,
+                message: 'GOST轮2户端安装成功',
+                output: stdout,
+                error: stderr || null
+              },
+              timestamp: Date.now()
+            };
+            ws.send(JSON.stringify(resultMessage));
+          }
+          
+          resolve();
+        } else {
+          console.error(`[Agent] GOST轮询客户端安装失败，退出码: ${code}`);
+          sendInstallProgress('error', `安装失败（退出码: ${code}）`, currentProgress, 'error');
+          
+          // 发送失败结果
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const resultMessage = {
+              type: 'install_result',
+              agentId: config.agentId,
+              secret: config.secret,
+              data: {
+                success: false,
+                message: 'GOST轮询客户端安装失败',
+                output: stdout,
+                error: stderr || `退出码: ${code}`
+              },
+              timestamp: Date.now()
+            };
+            ws.send(JSON.stringify(resultMessage));
+          }
+          
+          reject(new Error(`安装失败，退出码: ${code}`));
+        }
+      });
+      
+      // 设置超时（10分钟）
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill();
+          sendInstallProgress('error', '安装超时', currentProgress, 'error');
+          reject(new Error('安装超时'));
+        }
+      }, 600000);
+      
+    } catch (error) {
+      console.error(`[Agent] GOST轮询客户端安装失败: ${error.message}`);
+      sendInstallProgress('error', `安装失败: ${error.message}`, 0, 'error');
+      
+      // 发送失败结果
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const resultMessage = {
+          type: 'install_result',
+          agentId: config.agentId,
+          secret: config.secret,
+          data: {
+            success: false,
+            message: 'GOST轮询客户端安装失败',
+            output: '',
+            error: error.message
+          },
+          timestamp: Date.now()
+        };
+        ws.send(JSON.stringify(resultMessage));
+      }
+      
+      reject(error);
     }
-    
-    // 发送安装结果
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const resultMessage = {
-        type: 'install_result',
-        agentId: config.agentId,
-        secret: config.secret,
-        data: {
-          success: true,
-          message: 'GOST轮询客户端安装成功',
-          output: stdout,
-          error: stderr || null
-        },
-        timestamp: Date.now()
-      };
-      ws.send(JSON.stringify(resultMessage));
-    }
-    
-    console.log('[Agent] GOST轮询客户端安装成功');
-  } catch (error) {
-    console.error(`[Agent] GOST轮询客户端安装失败: ${error.message}`);
-    
-    // 发送失败结果
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const resultMessage = {
-        type: 'install_result',
-        agentId: config.agentId,
-        secret: config.secret,
-        data: {
-          success: false,
-          message: 'GOST轮询客户端安装失败',
-          output: error.stdout || '',
-          error: error.message
-        },
-        timestamp: Date.now()
-      };
-      ws.send(JSON.stringify(resultMessage));
-    }
-  }
+  });
 }
 
 // 执行部署脚本

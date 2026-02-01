@@ -131,6 +131,97 @@ async function sendHeartbeat() {
   }
 }
 
+// 处理命令
+async function handleCommand(commandData) {
+  console.log(`[Agent] 处理命令: ${commandData.type}`);
+  
+  switch (commandData.type) {
+    case 'install_polling_client':
+      await installPollingClient(commandData.script);
+      break;
+    case 'deploy':
+      await executeDeployScript(commandData.config);
+      break;
+    case 'restart':
+      console.log('[Agent] 收到重启命令，3秒后重启...');
+      setTimeout(() => {
+        process.exit(0); // systemd会自动重启
+      }, 3000);
+      break;
+    default:
+      console.log(`[Agent] 未知命令类型: ${commandData.type}`);
+  }
+}
+
+// 安装GOST轮询客户端
+async function installPollingClient(script) {
+  console.log('[Agent] 开始安装GOST轮询客户端...');
+  
+  try {
+    // 将脚本保存到临时文件
+    const scriptPath = `/tmp/install_gost_polling_${Date.now()}.sh`;
+    fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    console.log(`[Agent] 脚本已保存到: ${scriptPath}`);
+    
+    // 执行安装脚本
+    console.log('[Agent] 正在执行安装脚本...');
+    const { stdout, stderr } = await execAsync(`bash ${scriptPath}`, {
+      timeout: 600000, // 10分钟超时（安装Node.js可能需要较长时间）
+      maxBuffer: 20 * 1024 * 1024 // 20MB缓冲区
+    });
+    
+    console.log('[Agent] 安装输出:', stdout);
+    if (stderr) {
+      console.log('[Agent] 安装错误输出:', stderr);
+    }
+    
+    // 删除临时脚本
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch (err) {
+      // 忽略删除错误
+    }
+    
+    // 发送安装结果
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const resultMessage = {
+        type: 'install_result',
+        agentId: config.agentId,
+        secret: config.secret,
+        data: {
+          success: true,
+          message: 'GOST轮询客户端安装成功',
+          output: stdout,
+          error: stderr || null
+        },
+        timestamp: Date.now()
+      };
+      ws.send(JSON.stringify(resultMessage));
+    }
+    
+    console.log('[Agent] GOST轮询客户端安装成功');
+  } catch (error) {
+    console.error(`[Agent] GOST轮询客户端安装失败: ${error.message}`);
+    
+    // 发送失败结果
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const resultMessage = {
+        type: 'install_result',
+        agentId: config.agentId,
+        secret: config.secret,
+        data: {
+          success: false,
+          message: 'GOST轮询客户端安装失败',
+          output: error.stdout || '',
+          error: error.message
+        },
+        timestamp: Date.now()
+      };
+      ws.send(JSON.stringify(resultMessage));
+    }
+  }
+}
+
 // 执行部署脚本
 async function executeDeployScript(deployData) {
   console.log(`[Agent] 开始执行部署任务: ${deployData.nodeId}`);
@@ -199,6 +290,12 @@ function handleMessage(data) {
     console.log(`[Agent] 收到消息: ${message.type}`);
     
     switch (message.type) {
+      case 'command':
+        // 处理命令消息
+        if (message.data && message.data.type) {
+          handleCommand(message.data);
+        }
+        break;
       case 'deploy':
         executeDeployScript(message.data);
         break;

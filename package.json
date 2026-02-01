@@ -1,0 +1,21 @@
+{
+  "name": "vps-agent-client",
+  "version": "1.0.0",
+  "description": "VPS隧道管理面板 - Agent客户端",
+  "main": "agent.js",
+  "bin": {
+    "vps-agent": "./agent.js"
+  },
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "keywords": ["vps", "agent", "tunnel", "proxy"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

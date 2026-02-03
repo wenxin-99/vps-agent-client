@@ -2,633 +2,443 @@
 
 /**
  * VPS隧道管理面板 - Agent客户端
- * 
- * 功能：
- * 1. 连接到WebSocket服务器
- * 2. 定期发送心跳和系统监控数据
- * 3. 接收并执行部署命令
- * 4. 上报部署结果
+ * 安装在VPS上，自动连接到管理面板并上报状态
  */
 
 const WebSocket = require('ws');
-const fs = require('fs');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const { exec } = require('child_process');
-const { promisify } = require('util');
-const execAsync = promisify(exec);
+const util = require('util');
+const execPromise = util.promisify(exec);
 
-// 读取配置文件
-const CONFIG_PATH = process.env.CONFIG_PATH || '/opt/vps-agent/config.json';
-let config;
+// 配置文件路径
+const CONFIG_FILE = path.join(__dirname, 'config.json');
+const VERSION = '1.0.0';
 
-try {
-  const configContent = fs.readFileSync(CONFIG_PATH, 'utf8');
-  config = JSON.parse(configContent);
-  console.log(`[Agent] 配置加载成功: Agent ID=${config.agentId}, Name=${config.name}`);
-} catch (error) {
-  console.error(`[Agent] 无法读取配置文件: ${CONFIG_PATH}`);
-  console.error(error.message);
-  process.exit(1);
-}
-
-// 验证必需的配置项
-if (!config.agentId || !config.secret || !config.serverUrl) {
-  console.error('[Agent] 配置文件缺少必需字段: agentId, secret, serverUrl');
-  process.exit(1);
-}
-
-let ws = null;
-let heartbeatInterval = null;
-let reconnectTimeout = null;
-let isConnected = false;
-
-// 检查GOST服务状态
-async function getGostStatus() {
+// 读取配置
+function loadConfig() {
   try {
-    // 检查GOST服务是否运行
-    const { stdout: isActive } = await execAsync('systemctl is-active gost 2>/dev/null || echo "inactive"');
-    const active = isActive.trim() === 'active';
-    
-    if (!active) {
-      return {
-        running: false,
-        lastSync: null,
-        configHash: null,
-        ruleCount: 0
-      };
+    if (!fs.existsSync(CONFIG_FILE)) {
+      console.error('❌ 配置文件不存在:', CONFIG_FILE);
+      console.error('请确保 config.json 文件存在并包含正确的配置');
+      process.exit(1);
     }
     
-    // 读取GOST配置文件获取规则数量和哈希
-    let configHash = null;
-    let ruleCount = 0;
-    try {
-      const configPath = '/etc/gost/config.json';
-      if (fs.existsSync(configPath)) {
-        const configContent = fs.readFileSync(configPath, 'utf8');
-        const config = JSON.parse(configContent);
-        
-        // 计算配置哈希
-        const crypto = require('crypto');
-        configHash = crypto.createHash('sha256').update(configContent).digest('hex').substring(0, 16);
-        
-        // 统计规则数量（services数组长度）
-        if (config.services && Array.isArray(config.services)) {
-          ruleCount = config.services.length;
-        }
-      }
-    } catch (err) {
-      console.error('[Agent] 读取GOST配置失败:', err.message);
+    const configData = fs.readFileSync(CONFIG_FILE, 'utf8');
+    const config = JSON.parse(configData);
+    
+    if (!config.serverUrl || !config.secret) {
+      console.error('❌ 配置文件缺少必要字段: serverUrl 或 secret');
+      process.exit(1);
     }
     
-    // 获取最后同步时间（从gost-polling-client服务日志）
-    let lastSync = null;
-    try {
-      const { stdout: logOutput } = await execAsync(
-        'journalctl -u gost-polling-client -n 20 --no-pager 2>/dev/null | grep "配置更新完成" | tail -1'
-      );
-      if (logOutput.trim()) {
-        // 从日志中提取时间戳
-        const match = logOutput.match(/(\w{3}\s+\d{2}\s+\d{2}:\d{2}:\d{2})/);
-        if (match) {
-          lastSync = match[1];
-        }
-      }
-    } catch (err) {
-      // 忽略日志读取错误
-    }
-    
-    return {
-      running: true,
-      lastSync,
-      configHash,
-      ruleCount
-    };
+    return config;
   } catch (error) {
-    console.error('[Agent] 获取GOST状态失败:', error.message);
-    return {
-      running: false,
-      lastSync: null,
-      configHash: null,
-      ruleCount: 0
-    };
+    console.error('❌ 配置文件加载失败:', error.message);
+    process.exit(1);
   }
 }
 
-// 获取本机IP地址
-function getLocalIpAddress() {
-  const interfaces = os.networkInterfaces();
+// 获取系统信息
+async function getSystemInfo() {
+  const cpus = os.cpus();
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const uptime = os.uptime();
   
-  // 优先查找公网IP（通过接口名称判断）
-  for (const name of Object.keys(interfaces)) {
-    if (name.startsWith('lo')) continue; // 跳过回环接口
-    
-    const iface = interfaces[name];
-    for (const addr of iface) {
-      // 优先返回IPv4地址
-      if (addr.family === 'IPv4' && !addr.internal) {
-        return addr.address;
-      }
-    }
+  // CPU使用率（简化计算）
+  let cpuUsage = 0;
+  if (cpus.length > 0) {
+    const cpu = cpus[0];
+    const total = Object.values(cpu.times).reduce((a, b) => a + b, 0);
+    const idle = cpu.times.idle;
+    cpuUsage = ((total - idle) / total) * 100;
   }
   
-  // 如果没有找到IPv4，返回IPv6
-  for (const name of Object.keys(interfaces)) {
-    if (name.startsWith('lo')) continue;
-    
-    const iface = interfaces[name];
-    for (const addr of iface) {
-      if (addr.family === 'IPv6' && !addr.internal) {
-        return addr.address;
-      }
-    }
-  }
+  // 内存使用率
+  const memoryUsage = ((totalMem - freeMem) / totalMem) * 100;
   
-  return '未知';
-}
-
-// 获取系统监控数据
-async function getSystemStats() {
-  try {
-    const cpus = os.cpus();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
-    
-    // 计算CPU使用率（简化版本）
-    let totalIdle = 0;
-    let totalTick = 0;
-    cpus.forEach(cpu => {
-      for (const type in cpu.times) {
-        totalTick += cpu.times[type];
-      }
-      totalIdle += cpu.times.idle;
-    });
-    const cpuUsage = 100 - ~~(100 * totalIdle / totalTick);
-    
-    // 获取网络流量（从/proc/net/dev）
-    let networkStats = { received: 0, sent: 0 };
+  // 网络流量（从/proc/net/dev读取，仅Linux）
+  let bytesReceived = 0;
+  let bytesTransmitted = 0;
+  
+  if (os.platform() === 'linux') {
     try {
-      const netdev = fs.readFileSync('/proc/net/dev', 'utf8');
-      const lines = netdev.split('\n');
+      const netDev = fs.readFileSync('/proc/net/dev', 'utf8');
+      const lines = netDev.split('\n');
+      
       for (const line of lines) {
-        if (line.includes(':')) {
+        if (line.includes(':') && !line.includes('lo:')) {
           const parts = line.trim().split(/\s+/);
-          if (parts[0] && !parts[0].startsWith('lo:')) {
-            networkStats.received += parseInt(parts[1]) || 0;
-            networkStats.sent += parseInt(parts[9]) || 0;
+          if (parts.length >= 10) {
+            bytesReceived += parseInt(parts[1]) || 0;
+            bytesTransmitted += parseInt(parts[9]) || 0;
           }
         }
       }
-    } catch (err) {
-      console.error('[Agent] 无法读取网络统计:', err.message);
+    } catch (error) {
+      console.warn('⚠️ 无法读取网络流量:', error.message);
     }
-    
-    // 获取系统运行时间
-    const uptime = os.uptime();
-    
-    // 获取GOST服务状态
-    const gostStatus = await getGostStatus();
-    
-    return {
-      cpu: cpuUsage,
-      memory: {
-        total: totalMem,
-        used: usedMem,
-        free: freeMem,
-        percentage: (usedMem / totalMem * 100).toFixed(1)
-      },
-      network: networkStats,
-      uptime: Math.floor(uptime),
-      gost: gostStatus
-    };
-  } catch (error) {
-    console.error('[Agent] 获取系统统计失败:', error.message);
-    return null;
-  }
-}
-
-// 发送心跳
-async function sendHeartbeat() {
-  if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
-    return;
   }
   
-  try {
-    const stats = await getSystemStats();
-    if (!stats) {
+  return {
+    hostname: os.hostname(),
+    ipAddress: getLocalIP(),
+    os: `${os.type()} ${os.release()}`,
+    arch: os.arch(),
+    version: VERSION,
+    cpuUsage: parseFloat(cpuUsage.toFixed(2)),
+    memoryUsage: parseFloat(memoryUsage.toFixed(2)),
+    uptime: Math.floor(uptime),
+    bytesReceived,
+    bytesTransmitted,
+  };
+}
+
+// 获取本地IP地址
+function getLocalIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
+
+// Agent类
+class VPSAgent {
+  constructor(config) {
+    this.config = config;
+    this.ws = null;
+    this.reconnectDelay = 5000; // 5秒重连
+    this.heartbeatInterval = 30000; // 30秒心跳
+    this.heartbeatTimer = null;
+    this.isRegistered = false;
+  }
+  
+  // 连接到服务器
+  connect() {
+    const wsUrl = this.config.serverUrl.replace(/^http/, 'ws') + '/api/agent/ws';
+    console.log(`🔗 正在连接到服务器: ${wsUrl}`);
+    
+    this.ws = new WebSocket(wsUrl);
+    
+    this.ws.on('open', () => {
+      console.log('✅ 已连接到服务器');
+      this.register();
+    });
+    
+    this.ws.on('message', (data) => {
+      this.handleMessage(data);
+    });
+    
+    this.ws.on('close', () => {
+      console.log('🔌 连接已断开');
+      this.isRegistered = false;
+      this.stopHeartbeat();
+      this.scheduleReconnect();
+    });
+    
+    this.ws.on('error', (error) => {
+      console.error('❌ WebSocket错误:', error.message);
+    });
+  }
+  
+  // 注册Agent
+  async register() {
+    try {
+      const systemInfo = await getSystemInfo();
+      
+      const registerMessage = {
+        type: 'register',
+        data: {
+          secret: this.config.secret,
+          ...systemInfo,
+        },
+      };
+      
+      this.ws.send(JSON.stringify(registerMessage));
+      console.log('📤 已发送注册请求');
+    } catch (error) {
+      console.error('❌ 注册失败:', error.message);
+    }
+  }
+  
+  // 发送心跳
+  async sendHeartbeat() {
+    if (!this.isRegistered || this.ws.readyState !== WebSocket.OPEN) {
       return;
     }
     
-    const message = {
-      type: 'heartbeat',
-      agentId: config.agentId,
-      secret: config.secret,
-      data: {
-        hostname: os.hostname(),
-        ipAddress: getLocalIpAddress(),
-        platform: os.platform(),
-        arch: os.arch(),
-        ...stats
-      },
-      timestamp: Date.now()
-    };
+    try {
+      const systemInfo = await getSystemInfo();
+      
+      const heartbeatMessage = {
+        type: 'heartbeat',
+        data: systemInfo,
+      };
+      
+      this.ws.send(JSON.stringify(heartbeatMessage));
+      console.log('💓 已发送心跳');
+    } catch (error) {
+      console.error('❌ 心跳发送失败:', error.message);
+    }
+  }
+  
+  // 启动心跳定时器
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.sendHeartbeat();
+    }, this.heartbeatInterval);
+    console.log(`⏰ 心跳定时器已启动 (间隔: ${this.heartbeatInterval / 1000}秒)`);
+  }
+  
+  // 停止心跳定时器
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+  
+  // 处理服务器消息
+  handleMessage(data) {
+    try {
+      const message = JSON.parse(data.toString());
+      
+      switch (message.type) {
+        case 'registered':
+          console.log('✅ 注册成功, Agent ID:', message.agentId);
+          this.isRegistered = true;
+          this.startHeartbeat();
+          // 立即发送一次心跳
+          this.sendHeartbeat();
+          break;
+          
+        case 'heartbeat_ack':
+          // 心跳确认，无需处理
+          break;
+          
+        case 'command':
+          this.handleCommand(message.data);
+          break;
+          
+        case 'error':
+          console.error('❌ 服务器错误:', message.message);
+          if (message.message === 'Invalid secret') {
+            console.error('❌ 密钥无效，请检查配置文件');
+            process.exit(1);
+          }
+          break;
+          
+        default:
+          console.warn('⚠️ 未知消息类型:', message.type);
+      }
+    } catch (error) {
+      console.error('❌ 消息处理失败:', error.message);
+    }
+  }
+  
+  // 处理远程命令
+  async handleCommand(command) {
+    console.log('📥 收到远程命令:', command.type);
     
-    ws.send(JSON.stringify(message));
-    console.log(`[Agent] 心跳已发送 - CPU: ${stats.cpu}%, 内存: ${stats.memory.percentage}%`);
-  } catch (error) {
-    console.error('[Agent] 发送心跳失败:', error.message);
+    switch (command.type) {
+      case 'ping':
+        this.sendResponse(command.requestId, { success: true, message: 'pong' });
+        break;
+        
+      case 'restart':
+        console.log('🔄 重启Agent...');
+        this.sendResponse(command.requestId, { success: true, message: 'Restarting...' });
+        setTimeout(() => {
+          process.exit(0); // systemd会自动重启
+        }, 1000);
+        break;
+        
+      case 'execute':
+        await this.executeCommand(command.requestId, command.command);
+        break;
+        
+      case 'deploy':
+        await this.deployProtocol(command.requestId, command.config);
+        break;
+        
+      case 'reload_gost_config':
+        await this.reloadGostConfig(command.requestId, command.config);
+        break;
+        
+      default:
+        this.sendResponse(command.requestId, { success: false, message: 'Unknown command' });
+    }
   }
-}
-
-// 处理命令
-async function handleCommand(commandData) {
-  console.log(`[Agent] 处理命令: ${commandData.type}`);
   
-  switch (commandData.type) {
-    case 'install_polling_client':
-      await installPollingClient(commandData.script);
-      break;
-    case 'deploy':
-      await executeDeployScript(commandData.config);
-      break;
-    case 'restart':
-      console.log('[Agent] 收到重启命令，3秒后重启...');
-      setTimeout(() => {
-        process.exit(0); // systemd会自动重启
-      }, 3000);
-      break;
-    default:
-      console.log(`[Agent] 未知命令类型: ${commandData.type}`);
+  // 重载GOST配置
+  async reloadGostConfig(requestId, config) {
+    console.log('📥 收到GOST配置更新请求');
+    
+    try {
+      const configPath = '/etc/gost/config.json';
+      
+      // 确保配置目录存在
+      await execPromise('mkdir -p /etc/gost');
+      
+      // 写入配置文件
+      const configJson = JSON.stringify(config, null, 2);
+      fs.writeFileSync(configPath, configJson, 'utf8');
+      console.log(`✅ GOST配置已写入: ${configPath}`);
+      console.log(`📝 配置内容: ${configJson.substring(0, 200)}...`);
+      
+      // 重启GOST服务
+      console.log('🔄 正在重启GOST服务...');
+      try {
+        await execPromise('systemctl restart gost');
+        console.log('✅ GOST服务重启成功');
+        
+        // 等待服务启动
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // 检查服务状态
+        const { stdout: statusOutput } = await execPromise('systemctl is-active gost');
+        const isActive = statusOutput.trim() === 'active';
+        
+        this.sendResponse(requestId, {
+          success: true,
+          message: 'GOST配置已更新并重启服务',
+          serviceStatus: isActive ? 'active' : 'inactive',
+        });
+      } catch (restartError) {
+        console.error('⚠️ GOST服务重启失败:', restartError.message);
+        this.sendResponse(requestId, {
+          success: true,
+          message: 'GOST配置已更新，但服务重启失败',
+          error: restartError.message,
+        });
+      }
+    } catch (error) {
+      console.error('❌ GOST配置更新失败:', error.message);
+      this.sendResponse(requestId, {
+        success: false,
+        error: error.message,
+      });
+    }
   }
-}
-
-// 发送安装进度消息
-function sendInstallProgress(step, message, progress, status = 'running') {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    const progressMessage = {
-      type: 'install_progress',
-      agentId: config.agentId,
-      secret: config.secret,
-      data: {
-        step,
-        message,
-        progress,
-        status
-      },
-      timestamp: Date.now()
-    };
-    ws.send(JSON.stringify(progressMessage));
-  }
-}
-
-// 安装GOST轮询客户端
-async function installPollingClient(script) {
-  console.log('[Agent] 开始安装GOST轮询客户端...');
-  sendInstallProgress('init', '开始安装GOST轮询客户端...', 0, 'running');
   
-  return new Promise((resolve, reject) => {
+  // 部署协议
+  async deployProtocol(requestId, config) {
+    console.log(`📦 正在部署协议: ${config.protocol}`);
+    
     try {
       // 将脚本保存到临时文件
-      const scriptPath = `/tmp/install_gost_polling_${Date.now()}.sh`;
-      fs.writeFileSync(scriptPath, script, { mode: 0o755 });
-      console.log(`[Agent] 脚本已保存到: ${scriptPath}`);
-      sendInstallProgress('save_script', '脚本已保存到临时文件', 5, 'running');
+      const scriptPath = `/tmp/deploy_${config.protocol}_${Date.now()}.sh`;
+      fs.writeFileSync(scriptPath, config.script, { mode: 0o755 });
       
-      // 使用spawn执行脚本，逐行读取输出
-      const { spawn } = require('child_process');
-      const child = spawn('bash', [scriptPath]);
+      // 执行部署脚本
+      const { stdout, stderr } = await execPromise(`bash ${scriptPath}`);
       
-      let stdout = '';
-      let stderr = '';
-      let currentProgress = 10;
+      // 清理临时文件
+      fs.unlinkSync(scriptPath);
       
-      // 监听标准输出
-      child.stdout.on('data', (data) => {
-        const output = data.toString();
-        stdout += output;
-        console.log(`[Agent] 安装输出: ${output.trim()}`);
-        
-        // 根据输出内容判断安装阶段
-        if (output.includes('Node.js')) {
-          sendInstallProgress('nodejs', '正在安装Node.js...', 20, 'running');
-          currentProgress = 20;
-        } else if (output.includes('创建工作目录') || output.includes('写入')) {
-          sendInstallProgress('setup', '正在配置客户端...', 50, 'running');
-          currentProgress = 50;
-        } else if (output.includes('systemd') || output.includes('服务')) {
-          sendInstallProgress('service', '正在配置systemd服务...', 70, 'running');
-          currentProgress = 70;
-        } else if (output.includes('启动') || output.includes('enable')) {
-          sendInstallProgress('start', '正在启动服务...', 85, 'running');
-          currentProgress = 85;
-        } else if (output.includes('成功') || output.includes('active')) {
-          sendInstallProgress('complete', '安装完成！', 95, 'running');
-          currentProgress = 95;
-        } else if (currentProgress < 90) {
-          // 有输出就增加进度
-          currentProgress = Math.min(currentProgress + 2, 90);
-          sendInstallProgress('progress', output.trim().substring(0, 100), currentProgress, 'running');
-        }
+      console.log(`✅ 协议 ${config.protocol} 部署成功`);
+      this.sendResponse(requestId, {
+        success: true,
+        message: `协议 ${config.protocol} 部署成功`,
+        stdout,
+        stderr,
       });
-      
-      // 监听错误输出
-      child.stderr.on('data', (data) => {
-        const output = data.toString();
-        stderr += output;
-        console.log(`[Agent] 安装错误输出: ${output.trim()}`);
-      });
-      
-      // 监听进程退出
-      child.on('close', (code) => {
-        // 删除临时脚本
-        try {
-          fs.unlinkSync(scriptPath);
-        } catch (err) {
-          // 忽略删除错误
-        }
-        
-        if (code === 0) {
-          console.log('[Agent] GOST轮询客户端安装成功');
-          sendInstallProgress('success', 'GOST轮询客户端安装成功！', 100, 'success');
-          
-          // 发送最终结果
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            const resultMessage = {
-              type: 'install_result',
-              agentId: config.agentId,
-              secret: config.secret,
-              data: {
-                success: true,
-                message: 'GOST轮2户端安装成功',
-                output: stdout,
-                error: stderr || null
-              },
-              timestamp: Date.now()
-            };
-            ws.send(JSON.stringify(resultMessage));
-          }
-          
-          resolve();
-        } else {
-          console.error(`[Agent] GOST轮询客户端安装失败，退出码: ${code}`);
-          sendInstallProgress('error', `安装失败（退出码: ${code}）`, currentProgress, 'error');
-          
-          // 发送失败结果
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            const resultMessage = {
-              type: 'install_result',
-              agentId: config.agentId,
-              secret: config.secret,
-              data: {
-                success: false,
-                message: 'GOST轮询客户端安装失败',
-                output: stdout,
-                error: stderr || `退出码: ${code}`
-              },
-              timestamp: Date.now()
-            };
-            ws.send(JSON.stringify(resultMessage));
-          }
-          
-          reject(new Error(`安装失败，退出码: ${code}`));
-        }
-      });
-      
-      // 设置超时（10分钟）
-      setTimeout(() => {
-        if (!child.killed) {
-          child.kill();
-          sendInstallProgress('error', '安装超时', currentProgress, 'error');
-          reject(new Error('安装超时'));
-        }
-      }, 600000);
-      
     } catch (error) {
-      console.error(`[Agent] GOST轮询客户端安装失败: ${error.message}`);
-      sendInstallProgress('error', `安装失败: ${error.message}`, 0, 'error');
-      
-      // 发送失败结果
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const resultMessage = {
-          type: 'install_result',
-          agentId: config.agentId,
-          secret: config.secret,
-          data: {
-            success: false,
-            message: 'GOST轮询客户端安装失败',
-            output: '',
-            error: error.message
-          },
-          timestamp: Date.now()
-        };
-        ws.send(JSON.stringify(resultMessage));
-      }
-      
-      reject(error);
+      console.error(`❌ 协议部署失败:`, error.message);
+      this.sendResponse(requestId, {
+        success: false,
+        error: error.message,
+      });
     }
+  }
+  
+  // 执行Shell命令
+  async executeCommand(requestId, command) {
+    try {
+      const { stdout, stderr } = await execPromise(command);
+      this.sendResponse(requestId, {
+        success: true,
+        stdout,
+        stderr,
+      });
+    } catch (error) {
+      this.sendResponse(requestId, {
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+  
+  // 发送响应
+  sendResponse(requestId, data) {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'response',
+        requestId,
+        data,
+      }));
+    }
+  }
+  
+  // 安排重连
+  scheduleReconnect() {
+    console.log(`⏳ ${this.reconnectDelay / 1000}秒后尝试重连...`);
+    setTimeout(() => {
+      this.connect();
+    }, this.reconnectDelay);
+  }
+  
+  // 启动Agent
+  start() {
+    console.log('🚀 VPS Agent 启动中...');
+    console.log(`📋 版本: ${VERSION}`);
+    console.log(`🔧 服务器: ${this.config.serverUrl}`);
+    this.connect();
+  }
+}
+
+// 主函数
+function main() {
+  console.log('='.repeat(50));
+  console.log('VPS隧道管理面板 - Agent客户端');
+  console.log('='.repeat(50));
+  
+  const config = loadConfig();
+  const agent = new VPSAgent(config);
+  agent.start();
+  
+  // 优雅退出
+  process.on('SIGINT', () => {
+    console.log('\n👋 收到退出信号，正在关闭...');
+    agent.stopHeartbeat();
+    if (agent.ws) {
+      agent.ws.close();
+    }
+    process.exit(0);
+  });
+  
+  process.on('SIGTERM', () => {
+    console.log('\n👋 收到终止信号，正在关闭...');
+    agent.stopHeartbeat();
+    if (agent.ws) {
+      agent.ws.close();
+    }
+    process.exit(0);
   });
 }
 
-// 执行部署脚本
-async function executeDeployScript(deployData) {
-  console.log(`[Agent] 开始执行部署任务: ${deployData.nodeId}`);
-  
-  try {
-    // 将脚本保存到临时文件
-    const scriptPath = `/tmp/deploy_${deployData.nodeId}_${Date.now()}.sh`;
-    fs.writeFileSync(scriptPath, deployData.script, { mode: 0o755 });
-    
-    // 执行脚本
-    const { stdout, stderr } = await execAsync(`bash ${scriptPath}`, {
-      timeout: 300000, // 5分钟超时
-      maxBuffer: 10 * 1024 * 1024 // 10MB缓冲区
-    });
-    
-    // 删除临时脚本
-    try {
-      fs.unlinkSync(scriptPath);
-    } catch (err) {
-      // 忽略删除错误
-    }
-    
-    // 发送部署结果
-    const resultMessage = {
-      type: 'deploy_result',
-      agentId: config.agentId,
-      secret: config.secret,
-      data: {
-        nodeId: deployData.nodeId,
-        success: true,
-        output: stdout,
-        error: stderr || null
-      },
-      timestamp: Date.now()
-    };
-    
-    ws.send(JSON.stringify(resultMessage));
-    console.log(`[Agent] 部署任务完成: ${deployData.nodeId}`);
-  } catch (error) {
-    console.error(`[Agent] 部署任务失败: ${error.message}`);
-    
-    // 发送失败结果
-    const resultMessage = {
-      type: 'deploy_result',
-      agentId: config.agentId,
-      secret: config.secret,
-      data: {
-        nodeId: deployData.nodeId,
-        success: false,
-        output: error.stdout || '',
-        error: error.message
-      },
-      timestamp: Date.now()
-    };
-    
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(resultMessage));
-    }
-  }
+// 运行
+if (require.main === module) {
+  main();
 }
 
-// 处理服务器消息
-function handleMessage(data) {
-  try {
-    const message = JSON.parse(data);
-    console.log(`[Agent] 收到消息: ${message.type}`);
-    
-    switch (message.type) {
-      case 'command':
-        // 处理命令消息
-        if (message.data && message.data.type) {
-          handleCommand(message.data);
-        }
-        break;
-      case 'deploy':
-        executeDeployScript(message.data);
-        break;
-      case 'restart':
-        console.log('[Agent] 收到重启命令，3秒后重启...');
-        setTimeout(() => {
-          process.exit(0); // systemd会自动重启
-        }, 3000);
-        break;
-      default:
-        console.log(`[Agent] 未知消息类型: ${message.type}`);
-    }
-  } catch (error) {
-    console.error('[Agent] 处理消息失败:', error.message);
-  }
-}
-
-// 连接到WebSocket服务器
-function connect() {
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-    reconnectTimeout = null;
-  }
-  
-  console.log(`[Agent] 正在连接到服务器: ${config.serverUrl}`);
-  
-  try {
-    ws = new WebSocket(config.serverUrl, {
-      headers: {
-        'User-Agent': 'VPS-Agent/1.0'
-      }
-    });
-    
-    ws.on('open', () => {
-      console.log('[Agent] WebSocket连接已建立');
-      isConnected = true;
-      
-      // 发送注册消息
-      const registerMessage = {
-        type: 'register',
-        agentId: config.agentId,
-        secret: config.secret,
-        data: {
-          name: config.name,
-          hostname: os.hostname(),
-          ipAddress: getLocalIpAddress(),
-          platform: os.platform(),
-          arch: os.arch()
-        },
-        timestamp: Date.now()
-      };
-      
-      ws.send(JSON.stringify(registerMessage));
-      console.log('[Agent] 注册消息已发送');
-      
-      // 立即发送第一次心跳
-      sendHeartbeat();
-      
-      // 启动心跳定时器（每30秒）
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-      }
-      heartbeatInterval = setInterval(sendHeartbeat, 30000);
-    });
-    
-    ws.on('message', (data) => {
-      handleMessage(data.toString());
-    });
-    
-    ws.on('error', (error) => {
-      console.error('[Agent] WebSocket错误:', error.message);
-    });
-    
-    ws.on('close', (code, reason) => {
-      console.log(`[Agent] WebSocket连接已关闭: ${code} - ${reason}`);
-      isConnected = false;
-      
-      // 清理心跳定时器
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-      }
-      
-      // 5秒后重连
-      console.log('[Agent] 5秒后尝试重新连接...');
-      reconnectTimeout = setTimeout(connect, 5000);
-    });
-  } catch (error) {
-    console.error('[Agent] 连接失败:', error.message);
-    reconnectTimeout = setTimeout(connect, 5000);
-  }
-}
-
-// 优雅退出
-process.on('SIGINT', () => {
-  console.log('\n[Agent] 收到SIGINT信号，正在退出...');
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-  }
-  if (ws) {
-    ws.close();
-  }
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n[Agent] 收到SIGTERM信号，正在退出...');
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-  }
-  if (ws) {
-    ws.close();
-  }
-  process.exit(0);
-});
-
-// 启动Agent
-console.log('=== VPS隧道管理面板 - Agent客户端 ===');
-console.log(`Agent ID: ${config.agentId}`);
-console.log(`Agent名称: ${config.name}`);
-console.log(`服务器地址: ${config.serverUrl}`);
-console.log('=====================================');
-connect();
+module.exports = VPSAgent;

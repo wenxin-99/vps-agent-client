@@ -114,6 +114,38 @@ async function getGostStatus() {
   }
 }
 
+// 获取本机IP地址
+function getLocalIpAddress() {
+  const interfaces = os.networkInterfaces();
+  
+  // 优先查找公网IP（通过接口名称判断）
+  for (const name of Object.keys(interfaces)) {
+    if (name.startsWith('lo')) continue; // 跳过回环接口
+    
+    const iface = interfaces[name];
+    for (const addr of iface) {
+      // 优先返回IPv4地址
+      if (addr.family === 'IPv4' && !addr.internal) {
+        return addr.address;
+      }
+    }
+  }
+  
+  // 如果没有找到IPv4，返回IPv6
+  for (const name of Object.keys(interfaces)) {
+    if (name.startsWith('lo')) continue;
+    
+    const iface = interfaces[name];
+    for (const addr of iface) {
+      if (addr.family === 'IPv6' && !addr.internal) {
+        return addr.address;
+      }
+    }
+  }
+  
+  return '未知';
+}
+
 // 获取系统监控数据
 async function getSystemStats() {
   try {
@@ -193,6 +225,7 @@ async function sendHeartbeat() {
       secret: config.secret,
       data: {
         hostname: os.hostname(),
+        ipAddress: getLocalIpAddress(),
         platform: os.platform(),
         arch: os.arch(),
         ...stats
@@ -515,6 +548,7 @@ function connect() {
         data: {
           name: config.name,
           hostname: os.hostname(),
+          ipAddress: getLocalIpAddress(),
           platform: os.platform(),
           arch: os.arch()
         },
